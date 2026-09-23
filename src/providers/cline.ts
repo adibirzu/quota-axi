@@ -1,7 +1,8 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { readCachedProvider } from "../cache.js";
+import { readCachedClineProvider } from "../cache.js";
 import { readJsonFileResult, type JsonFileReadResult } from "../lib/fs.js";
+import { providerFetch, readBoundedResponseBody } from "../lib/http.js";
 import { nowIso, retryAfterToIso } from "../lib/time.js";
 import type {
   AuthProviderReport,
@@ -20,13 +21,17 @@ import {
   statusFromError,
   successProvider,
 } from "./common.js";
+import {
+  clearClineReadingContextId,
+  clineCacheContextId,
+  publishClineReadingContextId,
+} from "./cline-cache-context.js";
 
 // Cline (app.cline.bot) exposes a daily-resetting credit balance through its
 // public API. Phase 2 reads the local Bearer token, resolves the account's
 // organization, and reports the absolute remaining daily credit balance.
 const API_BASE = "https://api.cline.bot/api/v1";
 const API_TIMEOUT_MS = 15_000;
-const RESPONSE_LIMIT_BYTES = 256 * 1024;
 
 const PROVIDERS_JSON_SOURCE = "cline-providers-json";
 const API_KEY_SOURCE = "cline-api-key";
@@ -55,6 +60,7 @@ export const clineAdapter: ProviderAdapter = {
 export async function fetchQuota(
   _options: ProviderOptions,
 ): Promise<ProviderQuota> {
+  clearClineReadingContextId();
   const state = readCredentialState();
 
   if (state.status !== "available") {
@@ -74,6 +80,9 @@ export async function fetchQuota(
       ],
     });
   }
+
+  const cacheContextId = clineCacheContextId(state.source.source, state.token);
+  publishClineReadingContextId(cacheContextId);
 
   const attempts: SourceAttempt[] = [{ source: "api", status: "failed" }];
 
@@ -101,7 +110,7 @@ export async function fetchQuota(
       error: finalError,
     };
 
-    const cached = readCachedProvider("cline");
+    const cached = readCachedClineProvider(cacheContextId);
     const stale = cached
       ? staleFromCache(cached, finalError, sourceNames(attempts), attempts)
       : undefined;
@@ -123,12 +132,29 @@ export async function fetchQuota(
 export async function inspectAuth(
   _options: ProviderOptions,
 ): Promise<AuthProviderReport> {
-  const state = readCredentialState();
-  return { provider: "cline", sources: [state.source] };
+  const providersFilePath = clineProvidersFile();
+  const apiKeySource = inspectApiKeySource();
+  const providersJsonSource = extractCredentialState(
+    readJsonFileResult(providersFilePath),
+    providersFilePath,
+  ).source;
+  return { provider: "cline", sources: [apiKeySource, providersJsonSource] };
+}
+
+function inspectApiKeySource(): AuthSourceReport {
+  const inlineToken = stringValue(process.env.CLINE_API_KEY);
+  return authSource(
+    API_KEY_SOURCE,
+    undefined,
+    inlineToken ? "available" : "missing",
+  );
 }
 
 /**
- * Resolve the account's organization, then read its daily credit balance.
+ * Resolve the account's active organization, then read its daily credit
+ * balance. An account can belong to several organizations with one marked
+ * `active`; reporting any other would silently return the wrong balance, so a
+ * missing or ambiguous active flag fails closed rather than guessing.
  * `balance` is an absolute integer credit count that resets daily, so it is
  * reported through `credits` (like a prepaid balance) plus a percent-less
  * `daily_credits` window carrying the next UTC-midnight reset. No daily maximum
@@ -142,7 +168,12 @@ export async function fetchClineQuota(
   const organizations = Array.isArray(meData?.organizations)
     ? meData.organizations
     : [];
-  const organization = objectValue(organizations[0]);
+  const activeOrganizations = organizations
+    .map((org) => objectValue(org))
+    .filter((org): org is Record<string, unknown> => org?.active === true);
+  if (activeOrganizations.length !== 1)
+    throw new SafeClineError(CLINE_QUOTA_UNAVAILABLE_ERROR);
+  const organization = activeOrganizations[0];
   const organizationId = stringValue(organization?.organizationId);
   if (!organizationId) throw new SafeClineError(CLINE_QUOTA_UNAVAILABLE_ERROR);
 
@@ -153,7 +184,8 @@ export async function fetchClineQuota(
     ),
   );
   const balance = numberValue(objectValue(balancePayload?.data)?.balance);
-  if (balance === undefined) throw new SafeClineError(CLINE_QUOTA_UNAVAILABLE_ERROR);
+  if (balance === undefined)
+    throw new SafeClineError(CLINE_QUOTA_UNAVAILABLE_ERROR);
 
   const email = stringValue(meData?.email);
   const organizationName = stringValue(organization?.name);
@@ -188,7 +220,7 @@ async function clineGet(path: string, token: string): Promise<unknown> {
   try {
     let response: Response;
     try {
-      response = await fetch(`${API_BASE}${path}`, {
+      response = await providerFetch(`${API_BASE}${path}`, {
         method: "GET",
         headers: {
           Authorization: `Bearer ${token}`,
@@ -202,7 +234,16 @@ async function clineGet(path: string, token: string): Promise<unknown> {
       throw new SafeClineError(CLINE_QUOTA_UNAVAILABLE_ERROR);
     }
     rejectUnusableResponse(response);
-    return await readBoundedJson(response);
+    const bytes = await readBoundedResponseBody(
+      response,
+      controller.signal,
+      () => new SafeClineError(CLINE_QUOTA_UNAVAILABLE_ERROR),
+    );
+    try {
+      return JSON.parse(new TextDecoder().decode(bytes));
+    } catch {
+      throw new SafeClineError(CLINE_QUOTA_UNAVAILABLE_ERROR);
+    }
   } finally {
     clearTimeout(timer);
   }
@@ -213,51 +254,11 @@ function rejectUnusableResponse(response: Response): void {
     throw new SafeClineError(CLINE_SIGN_IN_REQUIRED_ERROR);
   }
   if (response.status === 429) {
-    throw new RateLimitError(retryAfterToIso(response.headers.get("retry-after")));
+    throw new RateLimitError(
+      retryAfterToIso(response.headers.get("retry-after")),
+    );
   }
   if (!response.ok) throw new SafeClineError(CLINE_QUOTA_UNAVAILABLE_ERROR);
-}
-
-async function readBoundedJson(response: Response): Promise<unknown> {
-  const contentLength = response.headers.get("content-length");
-  if (
-    contentLength &&
-    /^\d+$/.test(contentLength) &&
-    Number(contentLength) > RESPONSE_LIMIT_BYTES
-  ) {
-    throw new SafeClineError(CLINE_QUOTA_UNAVAILABLE_ERROR);
-  }
-  if (!response.body) throw new SafeClineError(CLINE_QUOTA_UNAVAILABLE_ERROR);
-
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let length = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      length += value.length;
-      if (length > RESPONSE_LIMIT_BYTES) {
-        await reader.cancel().catch(() => undefined);
-        throw new SafeClineError(CLINE_QUOTA_UNAVAILABLE_ERROR);
-      }
-      chunks.push(value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-
-  const bytes = new Uint8Array(length);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.length;
-  }
-  try {
-    return JSON.parse(new TextDecoder().decode(bytes));
-  } catch {
-    throw new SafeClineError(CLINE_QUOTA_UNAVAILABLE_ERROR);
-  }
 }
 
 function readCredentialState(): CredentialState {

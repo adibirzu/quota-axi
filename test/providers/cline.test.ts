@@ -180,33 +180,158 @@ describe("cline fetchQuota", () => {
     expect(result.state.status).toBe("error");
     expect(result.state.error).toBe("Cline quota unavailable");
   });
+
+  it("resolves the organization marked active, not organizations[0]", async () => {
+    writeProvidersJson("tok_ABC");
+    const multiOrgMe = {
+      data: {
+        ...ME_RESPONSE.data,
+        organizations: [
+          {
+            memberId: "mem_0",
+            organizationId: "org_0",
+            name: "Other Org",
+            roles: ["member"],
+            active: false,
+          },
+          {
+            memberId: "mem_1",
+            organizationId: "org_1",
+            name: "Cyber Security RO",
+            roles: ["owner"],
+            active: true,
+          },
+        ],
+      },
+      success: true,
+    };
+    stubApi({
+      "/users/me": { body: multiOrgMe },
+      "/organizations/org_1/balance": { body: BALANCE_RESPONSE },
+    });
+
+    const result = await fetchQuota(options);
+
+    expect(result.state.status).toBe("fresh");
+    expect(result.account).toEqual({
+      email: "adi@example.com",
+      organization: "Cyber Security RO",
+    });
+  });
+
+  it("fails closed instead of guessing when no organization is marked active", async () => {
+    writeProvidersJson("tok_ABC");
+    const noActiveOrgMe = {
+      data: {
+        ...ME_RESPONSE.data,
+        organizations: [
+          {
+            memberId: "mem_1",
+            organizationId: "org_1",
+            name: "Cyber Security RO",
+            roles: ["owner"],
+            active: false,
+          },
+        ],
+      },
+      success: true,
+    };
+    const fetchMock = stubApi({
+      "/users/me": { body: noActiveOrgMe },
+      "/organizations/org_1/balance": { body: BALANCE_RESPONSE },
+    });
+
+    const result = await fetchQuota(options);
+
+    expect(result.state.status).toBe("error");
+    expect(result.state.error).toBe("Cline quota unavailable");
+    // The organization is never guessed, so the balance endpoint is never called.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed instead of guessing when more than one organization is active", async () => {
+    writeProvidersJson("tok_ABC");
+    const ambiguousMe = {
+      data: {
+        ...ME_RESPONSE.data,
+        organizations: [
+          {
+            memberId: "mem_0",
+            organizationId: "org_0",
+            name: "Other Org",
+            roles: ["member"],
+            active: true,
+          },
+          {
+            memberId: "mem_1",
+            organizationId: "org_1",
+            name: "Cyber Security RO",
+            roles: ["owner"],
+            active: true,
+          },
+        ],
+      },
+      success: true,
+    };
+    stubApi({ "/users/me": { body: ambiguousMe } });
+
+    const result = await fetchQuota(options);
+
+    expect(result.state.status).toBe("error");
+    expect(result.state.error).toBe("Cline quota unavailable");
+  });
 });
 
 describe("cline inspectAuth", () => {
-  it("reports available when a providers.json token is present", async () => {
+  it("reports both sources when only providers.json carries a token", async () => {
     writeProvidersJson("tok_ABC");
     const report = await inspectAuth(options);
     expect(report.provider).toBe("cline");
-    expect(report.sources[0]).toMatchObject({
-      source: "cline-providers-json",
-      status: "available",
-    });
+    expect(report.sources).toEqual([
+      expect.objectContaining({ source: "cline-api-key", status: "missing" }),
+      expect.objectContaining({
+        source: "cline-providers-json",
+        status: "available",
+      }),
+    ]);
   });
 
-  it("reports missing when no providers.json exists", async () => {
+  it("reports both sources missing when neither is configured", async () => {
     const report = await inspectAuth(options);
-    expect(report.sources[0]).toMatchObject({
-      source: "cline-providers-json",
-      status: "missing",
-    });
+    expect(report.sources).toEqual([
+      expect.objectContaining({ source: "cline-api-key", status: "missing" }),
+      expect.objectContaining({
+        source: "cline-providers-json",
+        status: "missing",
+      }),
+    ]);
   });
 
-  it("reports available via the CLINE_API_KEY override", async () => {
+  it("reports the CLINE_API_KEY override alongside an absent providers.json", async () => {
     process.env.CLINE_API_KEY = "tok_ENV";
     const report = await inspectAuth(options);
-    expect(report.sources[0]).toMatchObject({
-      source: "cline-api-key",
-      status: "available",
-    });
+    expect(report.sources).toEqual([
+      expect.objectContaining({
+        source: "cline-api-key",
+        status: "available",
+      }),
+      expect.objectContaining({ source: "cline-providers-json" }),
+    ]);
+  });
+
+  it("reports the providers.json token even when CLINE_API_KEY also wins fetchQuota", async () => {
+    process.env.CLINE_API_KEY = "tok_ENV";
+    writeProvidersJson("tok_ABC");
+    const report = await inspectAuth(options);
+    expect(report.sources).toEqual([
+      expect.objectContaining({
+        source: "cline-api-key",
+        status: "available",
+      }),
+      expect.objectContaining({
+        source: "cline-providers-json",
+        status: "available",
+      }),
+    ]);
   });
 });
