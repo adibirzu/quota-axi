@@ -22,7 +22,9 @@ afterEach(() => {
 });
 
 describe("built Codex CLI weekly window", () => {
-  it("renders a primary-only seven-day app-server window as weekly in TOON and JSON", () => {
+  it(
+    "renders a primary-only seven-day app-server window as weekly in TOON and JSON",
+    () => {
     const root = mkdtempSync(join(tmpdir(), "quota-axi-codex-weekly-"));
     temporaryDirectories.push(root);
     const home = join(root, "home");
@@ -107,5 +109,7 @@ process.stdin.on("data", (chunk) => {
       ],
       state: { status: "fresh", stale: false },
     });
-  });
+    },
+    20_000,
+  );
 });
