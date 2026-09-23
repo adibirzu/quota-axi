@@ -145,6 +145,33 @@ describe("cline fetchQuota", () => {
     ).toBe("Bearer tok_ENV");
   });
 
+  it("fails closed on a non-literal CLINE_API_KEY reference instead of sending it or falling through", async () => {
+    process.env.CLINE_API_KEY = "$SECRET_MANAGER_REF";
+    // A valid providers.json token exists too, proving the invalid env
+    // override is never silently skipped in favor of a different account.
+    writeProvidersJson("tok_ABC");
+    const fetchMock = stubApi({
+      "/users/me": { body: ME_RESPONSE },
+      "/organizations/org_1/balance": { body: BALANCE_RESPONSE },
+    });
+
+    const result = await fetchQuota(options);
+
+    expect(result.state.status).toBe("auth_required");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("fails closed on a providers.json accessToken that is not a usable literal secret", async () => {
+    writeProvidersJson("$SECRET_MANAGER_REF");
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await fetchQuota(options);
+
+    expect(result.state.status).toBe("auth_required");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("reports sign-in required when no local token is present", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
@@ -333,5 +360,25 @@ describe("cline inspectAuth", () => {
         status: "available",
       }),
     ]);
+  });
+
+  it("reports a non-literal CLINE_API_KEY reference as invalid but present, not missing", async () => {
+    process.env.CLINE_API_KEY = "$SECRET_MANAGER_REF";
+    const report = await inspectAuth(options);
+    expect(report.sources[0]).toMatchObject({
+      source: "cline-api-key",
+      status: "invalid",
+      credentialPresent: true,
+    });
+  });
+
+  it("reports a non-literal providers.json accessToken as invalid but present, not missing", async () => {
+    writeProvidersJson("$SECRET_MANAGER_REF");
+    const report = await inspectAuth(options);
+    expect(report.sources[1]).toMatchObject({
+      source: "cline-providers-json",
+      status: "invalid",
+      credentialPresent: true,
+    });
   });
 });

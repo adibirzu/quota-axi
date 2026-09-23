@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { readCachedClineProvider } from "../cache.js";
 import { readJsonFileResult, type JsonFileReadResult } from "../lib/fs.js";
 import { providerFetch, readBoundedResponseBody } from "../lib/http.js";
+import { usableLiteralSecret } from "../lib/secret.js";
 import { nowIso, retryAfterToIso } from "../lib/time.js";
 import type {
   AuthProviderReport,
@@ -38,6 +39,7 @@ const API_KEY_SOURCE = "cline-api-key";
 const CLINE_SOURCE: ProviderSource = "api";
 const CLINE_SIGN_IN_REQUIRED_ERROR = "Cline sign-in required";
 const CLINE_QUOTA_UNAVAILABLE_ERROR = "Cline quota unavailable";
+const CLINE_CREDENTIAL_INVALID_ERROR = "cline_credential_invalid";
 
 type CredentialState =
   | { status: "available"; token: string; source: AuthSourceReport }
@@ -75,7 +77,7 @@ export async function fetchQuota(
           source: state.source.source,
           status: "skipped",
           error: `credentials_${state.status}`,
-          credentialPresent: false,
+          credentialPresent: state.source.credentialPresent ?? false,
         },
       ],
     });
@@ -142,12 +144,35 @@ export async function inspectAuth(
 }
 
 function inspectApiKeySource(): AuthSourceReport {
-  const inlineToken = stringValue(process.env.CLINE_API_KEY);
+  const resolution = resolveApiKeyCredential();
   return authSource(
     API_KEY_SOURCE,
     undefined,
-    inlineToken ? "available" : "missing",
+    resolution.status,
+    resolution.status === "invalid"
+      ? CLINE_CREDENTIAL_INVALID_ERROR
+      : undefined,
   );
+}
+
+type ApiKeyResolution =
+  | { status: "missing" }
+  | { status: "invalid" }
+  | { status: "available"; token: string };
+
+/**
+ * A non-blank `CLINE_API_KEY` that is not a usable literal secret (a `$VAR` /
+ * `!cmd` reference, or a value with control bytes) is the identity the vendor
+ * would use, not an absent one; it must not be sent as a Bearer token, and
+ * falling through to providers.json here would silently report a different
+ * account. Only a blank or unset variable defers to the file.
+ */
+function resolveApiKeyCredential(): ApiKeyResolution {
+  const raw = process.env.CLINE_API_KEY;
+  if (raw === undefined || raw.trim().length === 0)
+    return { status: "missing" };
+  const token = usableLiteralSecret(raw);
+  return token ? { status: "available", token } : { status: "invalid" };
 }
 
 /**
@@ -262,12 +287,23 @@ function rejectUnusableResponse(response: Response): void {
 }
 
 function readCredentialState(): CredentialState {
-  const inlineToken = stringValue(process.env.CLINE_API_KEY);
-  if (inlineToken) {
+  const resolution = resolveApiKeyCredential();
+  if (resolution.status === "available") {
     return {
       status: "available",
-      token: inlineToken,
+      token: resolution.token,
       source: authSource(API_KEY_SOURCE, undefined, "available"),
+    };
+  }
+  if (resolution.status === "invalid") {
+    return {
+      status: "invalid",
+      source: authSource(
+        API_KEY_SOURCE,
+        undefined,
+        "invalid",
+        CLINE_CREDENTIAL_INVALID_ERROR,
+      ),
     };
   }
   const path = clineProvidersFile();
@@ -307,7 +343,7 @@ function accessTokenFrom(value: unknown): string | undefined {
   const cline = objectValue(providers?.cline);
   const settings = objectValue(cline?.settings);
   const auth = objectValue(settings?.auth);
-  return stringValue(auth?.accessToken);
+  return usableLiteralSecret(auth?.accessToken);
 }
 
 function clineProvidersFile(): string {
@@ -334,7 +370,10 @@ function authSource(
     ...(path ? { path } : {}),
     status,
     ...(error ? { error } : {}),
-    credentialPresent: status === "available",
+    // "invalid" always means a source was present but unusable (a malformed
+    // providers.json, a missing accessToken, or a non-literal CLINE_API_KEY
+    // reference), never absence.
+    credentialPresent: status === "available" || status === "invalid",
   };
 }
 
